@@ -330,7 +330,7 @@ class ModelManager:
 
             if self.lora_path is not None and "qwen-image-edit" in self.model_path.lower():
                 cache_config_obj = DBCacheConfig(
-                    residual_diff_threshold=0.24,
+                    residual_diff_threshold=0.12,
                     enable_separate_cfg=True,
                     cfg_diff_compute_separate=True,
                 )
@@ -341,6 +341,8 @@ class ModelManager:
 
             if self.cache_config:
                 for key, value in self.cache_config.items():
+                    if key in ['residual_diff_threshold','enable_separate_cfg','cfg_diff_compute_separate']:
+                       continue
                     setattr(cache_config_obj, key, value)
         print('cache_config_obj is ', cache_config_obj)
         params_modifiers = None
