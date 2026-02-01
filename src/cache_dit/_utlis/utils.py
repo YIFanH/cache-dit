@@ -5,18 +5,20 @@ from diffusers import DiffusionPipeline
 from typing import Optional, List, Tuple
 from diffusers.quantizers import PipelineQuantizationConfig
 
-import cache_dit
-from cache_dit import init_logger
-from cache_dit.quantize.utils import normalize_quantize_type
-from cache_dit import (
+from ..logger import init_logger
+from ..platforms import current_platform
+from ..quantize import normalize_quantize_type, quantize
+from ..compile.utils import set_compile_configs
+from ..parallelism import ParallelismBackend, ParallelismConfig
+from ..caching import enable_cache, steps_mask, set_attn_backend
+from ..caching import (
     BlockAdapter,
     DBCacheConfig,
-    ParallelismBackend,
-    ParallelismConfig,
     TaylorSeerCalibratorConfig,
+    load_configs,
+    load_parallelism_config,
 )
-
-from cache_dit.platforms import current_platform
+from ..summary import strify as summary_strify
 
 logger = init_logger(__name__)
 
@@ -380,6 +382,13 @@ def get_args(
             "tp",
             "ulysses",
             "ring",
+            "usp",
+            # hybrid cp + tp
+            "ulysses_tp",  # prefer ulysses first
+            "ring_tp",
+            "tp_ulysses",  # prefer tp first
+            "tp_ring",
+            "usp_tp",
         ],
     )
     parser.add_argument(
@@ -419,6 +428,7 @@ def get_args(
             "_native_npu",  # native npu attention
         ],
     )
+    # Ulysses context parallelism settings
     parser.add_argument(
         "--ulysses-anything",
         "--uaa",
@@ -439,6 +449,26 @@ def get_args(
         action="store_true",
         default=False,
         help="Enabled experimental Async QKV Projection with Ulysses for context parallelism",
+    )
+    # Ring context parallelism settings
+    parser.add_argument(
+        "--ring-rotate-method",
+        "--rotate",
+        type=str,
+        default="p2p",
+        choices=[
+            "allgather",
+            "p2p",
+        ],
+        help="Ring Attention rotation method for context parallelism",
+    )
+    parser.add_argument(
+        "--ring-no-convert-to-fp32",
+        "--ring-no-fp32",
+        "--no-fp32",
+        action="store_true",
+        default=False,
+        help="Disable convert Ring Attention output and lse to fp32 for context parallelism",
     )
     # Offload settings
     parser.add_argument(
@@ -757,7 +787,7 @@ def maybe_compile_controlnet(
     pipe_or_adapter: DiffusionPipeline | BlockAdapter,
 ) -> DiffusionPipeline | BlockAdapter:
     if args.compile_controlnet:
-        cache_dit.set_compile_configs()
+        set_compile_configs()
         torch.set_float32_matmul_precision("high")
 
         if isinstance(pipe_or_adapter, BlockAdapter):
@@ -849,7 +879,7 @@ def maybe_compile_transformer(
     pipe_or_adapter: DiffusionPipeline | BlockAdapter,
 ) -> DiffusionPipeline | BlockAdapter:
     if args.compile:
-        cache_dit.set_compile_configs()
+        set_compile_configs()
         torch.set_float32_matmul_precision("high")
 
         if isinstance(pipe_or_adapter, BlockAdapter):
@@ -941,7 +971,7 @@ def maybe_quantize_transformer(
                         f"Quantizing transformer module: {transformer_cls_name} to"
                         f" {args.quantize_type} ..."
                     )
-                    transformer = cache_dit.quantize(
+                    transformer = quantize(
                         transformer,
                         quant_type=args.quantize_type,
                         per_row=is_per_row_supported(transformer),
@@ -965,7 +995,7 @@ def maybe_quantize_transformer(
                         f"Quantizing transformer_2 module: {transformer_2_cls_name} to"
                         f" {args.quantize_type} ..."
                     )
-                    transformer_2 = cache_dit.quantize(
+                    transformer_2 = quantize(
                         transformer_2,
                         quant_type=args.quantize_type,
                         per_row=is_per_row_supported(transformer_2),
@@ -1008,7 +1038,7 @@ def maybe_quantize_text_encoder(
                     f"Quantizing text encoder module: {name}:{text_encoder_cls_name} to"
                     f" {args.quantize_text_type} ..."
                 )
-                text_encoder = cache_dit.quantize(
+                text_encoder = quantize(
                     text_encoder,
                     quant_type=args.quantize_text_type,
                 )
@@ -1051,7 +1081,7 @@ def maybe_quantize_controlnet(
                         f"Quantizing controlnet module: {controlnet_cls_name} to"
                         f" {args.quantize_controlnet_type} ..."
                     )
-                    controlnet = cache_dit.quantize(
+                    controlnet = quantize(
                         controlnet,
                         quant_type=args.quantize_controlnet_type,
                     )
@@ -1187,54 +1217,6 @@ def maybe_apply_optimization(
     pipe_or_adapter,
     **kwargs,
 ):
-    if args.attn is not None and args.parallel_type is None:
-        # NON-parallelism case: set attention backend directly
-        try:
-            from cache_dit.parallelism.attention import _maybe_register_custom_attn_backends
-
-            _maybe_register_custom_attn_backends()
-        except Exception as e:
-            logger.warning(
-                "Failed to register custom attention backends. "
-                f"Proceeding to set attention backend anyway. Error: {e}"
-            )
-
-        def _set_backend(module):
-            if module is None:
-                return
-            if hasattr(module, "set_attention_backend"):
-                module.set_attention_backend(args.attn)
-                logger.info(
-                    f"Set attention backend to {args.attn} for module: {module.__class__.__name__}."
-                )
-            else:
-                logger.warning(
-                    "--attn was provided but module does not support set_attention_backend: "
-                    f"{module.__class__.__name__}."
-                )
-
-        try:
-            if isinstance(pipe_or_adapter, BlockAdapter):
-                transformer = pipe_or_adapter.transformer
-                if isinstance(transformer, list):
-                    for t in transformer:
-                        _set_backend(t)
-                else:
-                    _set_backend(transformer)
-            else:
-                pipe = pipe_or_adapter
-                if hasattr(pipe, "transformer"):
-                    _set_backend(getattr(pipe, "transformer"))
-                else:
-                    _set_backend(pipe)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to set attention backend to {args.attn}. "
-                "This usually means the backend is unavailable (e.g., FlashAttention-3 not installed) "
-                "or the model/shape/dtype is unsupported. "
-                f"Original error: {e}"
-            ) from e
-
     default_num_inference_steps = kwargs.pop("default_num_inference_steps", None)
     if args.cache or args.parallel_type is not None or args.config_path is not None:
 
@@ -1242,12 +1224,6 @@ def maybe_apply_optimization(
             # Construct acceleration configs from command line args if config path is not provided
             cache_config = kwargs.pop("cache_config", None)
             parallelism_config = kwargs.pop("parallelism_config", None)
-
-            backend = (
-                ParallelismBackend.NATIVE_PYTORCH
-                if args.parallel_type in ["tp"]
-                else ParallelismBackend.NATIVE_DIFFUSER
-            )
 
             extra_parallel_modules = prepare_extra_parallel_modules(
                 args,
@@ -1259,19 +1235,13 @@ def maybe_apply_optimization(
                 "attention_backend": ("native" if not args.attn else args.attn),
                 # e.g., text_encoder_2 in FluxPipeline, text_encoder in Flux2Pipeline
                 "extra_parallel_modules": extra_parallel_modules,
+                # experimental settings for context parallelism
+                "experimental_ulysses_anything": args.ulysses_anything,
+                "experimental_ulysses_float8": args.ulysses_float8,
+                "experimental_ulysses_async": args.ulysses_async,
+                "ring_rotate_method": args.ring_rotate_method,
+                "ring_convert_to_fp32": not args.ring_no_convert_to_fp32,
             }
-            if backend == ParallelismBackend.NATIVE_PYTORCH:
-                if args.attn is None:
-                    parallel_kwargs["attention_backend"] = None
-
-            if backend == ParallelismBackend.NATIVE_DIFFUSER:
-                parallel_kwargs.update(
-                    {
-                        "experimental_ulysses_anything": args.ulysses_anything,
-                        "experimental_ulysses_float8": args.ulysses_float8,
-                        "experimental_ulysses_async": args.ulysses_async,
-                    }
-                )
 
             # Caching and Parallelism
             if args.steps_mask and args.mask_policy is not None:
@@ -1285,14 +1255,50 @@ def maybe_apply_optimization(
                     num_inference_steps = args.num_inference_steps
                 else:
                     num_inference_steps = default_num_inference_steps
-                steps_computation_mask = cache_dit.steps_mask(
+                steps_computation_mask = steps_mask(
                     total_steps=num_inference_steps,
                     mask_policy=args.mask_policy,
                 )
             else:
                 steps_computation_mask = None
 
-            cache_dit.enable_cache(
+            def _prepare_distributed_size():
+                if args.parallel_type is not None:
+                    world_size = dist.get_world_size() if dist.is_initialized() else 1
+                    ulysses_size = world_size if args.parallel_type == "ulysses" else None
+                    ring_size = world_size if args.parallel_type == "ring" else None
+                    tp_size = world_size if args.parallel_type == "tp" else None
+                    if args.parallel_type == "usp":
+                        ulysses_size = max(1, world_size // 2)
+                        ring_size = world_size // ulysses_size
+                        tp_size = None
+                    elif args.parallel_type == "ulysses_tp":
+                        ulysses_size = max(1, world_size // 2)  # e.g, 4
+                        ring_size = None
+                        tp_size = world_size // ulysses_size  # e.g., 2
+                    elif args.parallel_type == "tp_ulysses":
+                        tp_size = max(1, world_size // 2)
+                        ulysses_size = world_size // tp_size
+                        ring_size = None
+                    elif args.parallel_type == "ring_tp":
+                        ulysses_size = None
+                        ring_size = max(1, world_size // 2)
+                        tp_size = world_size // ring_size
+                    elif args.parallel_type == "tp_ring":
+                        ulysses_size = None
+                        tp_size = max(1, world_size // 2)
+                        ring_size = world_size // tp_size
+                    elif args.parallel_type == "usp_tp":
+                        assert world_size == 8, "usp_tp currently only supports world size of 8."
+                        ulysses_size = 2
+                        ring_size = 2
+                        tp_size = 2
+                    return ulysses_size, ring_size, tp_size
+                return None, None, None
+
+            ulysses_size, ring_size, tp_size = _prepare_distributed_size()
+
+            enable_cache(
                 pipe_or_adapter,
                 cache_config=(
                     DBCacheConfig(
@@ -1319,26 +1325,34 @@ def maybe_apply_optimization(
                 params_modifiers=kwargs.get("params_modifiers", None),
                 parallelism_config=(
                     ParallelismConfig(
-                        ulysses_size=(
-                            dist.get_world_size() if args.parallel_type == "ulysses" else None
-                        ),
-                        ring_size=(dist.get_world_size() if args.parallel_type == "ring" else None),
-                        tp_size=(dist.get_world_size() if args.parallel_type == "tp" else None),
-                        backend=backend,
+                        ulysses_size=ulysses_size,
+                        ring_size=ring_size,
+                        tp_size=tp_size,
+                        backend=ParallelismBackend.AUTO,
                         parallel_kwargs=parallel_kwargs,
                     )
-                    if parallelism_config is None
-                    and args.parallel_type in ["ulysses", "ring", "tp"]
+                    if parallelism_config is None and args.parallel_type is not None
                     else parallelism_config
+                ),
+                # Allow attention backend for non-parallelism case
+                attention_backend=(
+                    ("native" if not args.attn else args.attn)
+                    if args.parallel_type is None
+                    else None
                 ),
             )
         else:
             # Apply acceleration configs from config path
-            cache_dit.enable_cache(
+            enable_cache(
                 pipe_or_adapter,
-                **cache_dit.load_configs(args.config_path),
+                **load_configs(args.config_path),
             )
             logger.info(f"Applied acceleration from {args.config_path}.")
+    else:
+        logger.info("No caching or parallelism is applied.")
+        if args.attn is not None:
+            logger.info(f"Applying custom attention backend: {args.attn} ...")
+            set_attn_backend(pipe_or_adapter, attention_backend=args.attn)
 
     # Quantization
     # WARN: Must apply quantization after tensor parallelism is applied.
@@ -1380,7 +1394,7 @@ def strify(args, pipe_or_stats):
         quantize_type = f"_{quantize_type}"
     base_str += (
         f"C{int(args.compile)}_Q{int(args.quantize)}{quantize_type}_"
-        f"{cache_dit.strify(pipe_or_stats)}"
+        f"{summary_strify(pipe_or_stats)}"
     )
     if args.ulysses_anything:
         base_str += "_ulysses_anything"
@@ -1391,6 +1405,11 @@ def strify(args, pipe_or_stats):
             base_str += "_ulysses_float8"
     if args.ulysses_async:
         base_str += "_ulysses_async"
+    if args.parallel_type == "ring" or args.parallel_type == "usp":
+        if args.ring_rotate_method is not None:
+            base_str += f"_rotated_{args.ring_rotate_method}"
+        if args.ring_no_convert_to_fp32:
+            base_str += "_no_fp32"
     if args.parallel_text_encoder:
         if "_TEP" not in base_str:
             base_str += "_TEP"  # Text Encoder Parallelism
@@ -1416,15 +1435,12 @@ def get_rank_device():
 
 
 def maybe_init_distributed(args=None):
-    from cache_dit.platforms.platform import CpuPlatform
+    from ..platforms.platform import CpuPlatform
 
     platform_full_backend = current_platform.full_dist_backend
     cpu_full_backend = CpuPlatform.full_dist_backend
-    backend = (
-        f"{cpu_full_backend},{platform_full_backend}"
-        if args.ulysses_anything
-        else current_platform.dist_backend
-    )
+    # Always use hybrid comm backend since there no side effect.
+    backend = f"{cpu_full_backend},{platform_full_backend}"
     if args is not None:
         if args.parallel_type is not None:
             dist.init_process_group(
@@ -1435,7 +1451,7 @@ def maybe_init_distributed(args=None):
             return rank, device
         elif args.config_path is not None:
             # check if distributed is needed from config file
-            has_parallelism_config = cache_dit.load_parallelism_config(
+            has_parallelism_config = load_parallelism_config(
                 args.config_path,
                 check_only=True,
             )
@@ -1472,7 +1488,7 @@ def maybe_destroy_distributed():
 
 
 def create_profiler_from_args(args, profile_name=None):
-    from cache_dit.profiler import ProfilerContext
+    from ..profiler import ProfilerContext
 
     return ProfilerContext(
         enabled=args.profile,

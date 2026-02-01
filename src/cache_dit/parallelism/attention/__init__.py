@@ -1,4 +1,5 @@
 from cache_dit.envs import ENV
+from ._context_parallel_utils import _ExtendedContextParallelConfig
 from ._distributed_primitives import (
     _unified_all_to_all_o_async_fn,
     _unified_all_to_all_qkv_async_fn,
@@ -24,10 +25,13 @@ def _maybe_register_custom_attn_backends():
 
     ENV.CACHE_DIT_ENABLE_CUSTOM_ATTN_ALREADY_DISPATCH = True
 
-    from ._attention_dispatch import (
-        _native_attention,
-        _sdpa_cudnn_attention,
-        _sage_attention,
-        _flash_attention_3,
-        _native_npu_attention,
-    )
+    try:
+        from ._attention_dispatch import (
+            _native_attention,
+            _sdpa_cudnn_attention,
+            _sage_attention,
+            _flash_attention_3,
+            _native_npu_attention,
+        )
+    except ImportError as e:
+        raise e

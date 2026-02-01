@@ -1,7 +1,6 @@
 import torch
 import math
 from typing import Optional
-from cache_dit.platforms import current_platform
 
 try:
     from diffusers.models.attention_dispatch import (
@@ -30,9 +29,9 @@ try:
         _flash_attn_3_available = False
 
     # For native npu attention backend re-registration
-    if current_platform.device_type == "npu":
+    try:
         from torch_npu import npu_fusion_attention
-    else:
+    except ImportError:
         npu_fusion_attention = None
 
     from diffusers.models._modeling_parallel import ParallelConfig
@@ -47,6 +46,8 @@ from cache_dit.envs import ENV
 
 from ._templated_ring import UnifiedTemplatedRingAttention
 from ._templated_ulysses import UnifiedTemplatedUlyssesAttention
+from ._templated_usp import UnifiedTemplatedUSPAttention
+
 
 logger = init_logger(__name__)
 MAX_TOKEN = 2147483647
@@ -121,8 +122,25 @@ if ENV.CACHE_DIT_ENABLE_CUSTOM_ATTN_DISPATCH:
         if enable_gqa:
             raise ValueError("GQA is not yet supported for templated attention.")
 
-        # TODO: add support for unified attention with ring/ulysses degree both being > 1
-        if _parallel_config.context_parallel_config.ring_degree > 1:
+        if (
+            _parallel_config.context_parallel_config.ring_degree > 1
+            and _parallel_config.context_parallel_config.ulysses_degree > 1
+        ):
+            return UnifiedTemplatedUSPAttention.apply(
+                query,
+                key,
+                value,
+                attn_mask,
+                dropout_p,
+                is_causal,
+                scale,
+                enable_gqa,
+                return_lse,
+                forward_op,
+                backward_op,
+                _parallel_config,
+            )
+        elif _parallel_config.context_parallel_config.ring_degree > 1:
             return UnifiedTemplatedRingAttention.apply(
                 query,
                 key,
@@ -197,8 +215,12 @@ if ENV.CACHE_DIT_ENABLE_CUSTOM_ATTN_DISPATCH:
                 is_causal=is_causal,
                 scale=scale,
             )[:2]
-            out = out.transpose(1, 2)
-            lse = lse.transpose(1, 2)
+            # [B, H, N, D] -> [B, N, H, D]
+            out = out.transpose(1, 2)  # type: torch.Tensor
+            lse = lse.transpose(1, 2)  # type: torch.Tensor
+            if lse.dim() == 3:
+                # [B, N, H] -> [B, N, H, 1]
+                lse = lse.unsqueeze(-1)
             return out, lse
 
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
@@ -638,6 +660,27 @@ if ENV.CACHE_DIT_ENABLE_CUSTOM_ATTN_DISPATCH:
 
     _registry_pop_attn_backend(AttentionBackendName._NATIVE_NPU)
 
+    def _maybe_modify_attn_mask_npu(
+        query: torch.Tensor, key: torch.Tensor, attn_mask: Optional[torch.Tensor] = None
+    ):
+        # Skip Attention Mask if all values are 1, `None` mask can speedup the computation
+        if attn_mask is not None and torch.all(attn_mask != 0):
+            attn_mask = None
+
+        # Reshape Attention Mask: [batch_size, seq_len_k] -> [batch_size, 1, sqe_len_q, seq_len_k]
+        # https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_fusion_attention.md
+        if (
+            attn_mask is not None
+            and attn_mask.ndim == 2
+            and attn_mask.shape[0] == query.shape[0]
+            and attn_mask.shape[1] == key.shape[1]
+        ):
+            B, Sq, Skv = attn_mask.shape[0], query.shape[1], key.shape[1]
+            attn_mask = ~attn_mask.to(torch.bool)
+            attn_mask = attn_mask.unsqueeze(1).expand(B, Sq, Skv).unsqueeze(1).contiguous()
+
+        return attn_mask
+
     @_AttentionBackendRegistry.register(
         AttentionBackendName._NATIVE_NPU,
         constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
@@ -647,6 +690,7 @@ if ENV.CACHE_DIT_ENABLE_CUSTOM_ATTN_DISPATCH:
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
         scale: Optional[float] = None,
         return_lse: bool = False,
@@ -655,11 +699,12 @@ if ENV.CACHE_DIT_ENABLE_CUSTOM_ATTN_DISPATCH:
         if return_lse:
             raise ValueError("NPU attention backend does not support setting `return_lse=True`.")
         if _parallel_config is None:
+            attn_mask = _maybe_modify_attn_mask_npu(query, key, attn_mask)
             out = npu_fusion_attention(
                 query,
                 key,
                 value,
-                atten_mask=None,
+                atten_mask=attn_mask,
                 input_layout="BSND",
                 scale=1.0 / math.sqrt(query.shape[-1]) if scale is None else scale,
                 pre_tockens=MAX_TOKEN,
@@ -671,7 +716,7 @@ if ENV.CACHE_DIT_ENABLE_CUSTOM_ATTN_DISPATCH:
                 query,
                 key,
                 value,
-                None,
+                attn_mask,
                 dropout_p,
                 None,
                 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale,
@@ -706,8 +751,7 @@ if ENV.CACHE_DIT_ENABLE_CUSTOM_ATTN_DISPATCH:
         if return_lse:
             raise ValueError("NPU attention backend does not support setting `return_lse=True`.")
 
-        if attn_mask is not None:
-            attn_mask = ~attn_mask.to(torch.bool)
+        attn_mask = _maybe_modify_attn_mask_npu(query, key, attn_mask)
         out = npu_fusion_attention(
             query,
             key,

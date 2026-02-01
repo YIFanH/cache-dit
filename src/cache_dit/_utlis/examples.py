@@ -3,15 +3,14 @@ import math
 import torch
 import argparse
 import PIL.Image
-import cache_dit
 import numpy as np
 from typing import Tuple, List, Optional
 from diffusers.utils import load_image
 from diffusers import FlowMatchEulerDiscreteScheduler
-from cache_dit import DBCacheConfig, ParamsModifier
-from cache_dit.logger import init_logger
+from ..caching import DBCacheConfig, ParamsModifier, steps_mask
+from ..logger import init_logger
 
-from base import (
+from .registers import (
     Example,
     ExampleType,
     ExampleInputData,
@@ -74,10 +73,11 @@ _env_path_mapping = {
     "WAN_2_2_I2V_DIR": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
     "WAN_VACE_DIR": "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
     "WAN_2_2_VACE_DIR": "linoyts/Wan2.2-VACE-Fun-14B-diffusers",
-    "ZIMAGE_DIR": "Tongyi-MAI/Z-Image-Turbo",
-    "NUNCHAKU_ZIMAGE_DIR": "nunchaku-tech/nunchaku-z-image-turbo",
-    "Z_IMAGE_CONTROLNET_2_1_DIR": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
-    "Z_IMAGE_CONTROLNET_2_0_DIR": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.0",
+    "ZIMAGE_DIR": "Tongyi-MAI/Z-Image",
+    "ZIMAGE_TURBO_DIR": "Tongyi-MAI/Z-Image-Turbo",
+    "NUNCHAKU_ZIMAGE_TURBO_DIR": "nunchaku-tech/nunchaku-z-image-turbo",
+    "Z_IMAGE_TURBO_CONTROLNET_2_1_DIR": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
+    "Z_IMAGE_TURBO_CONTROLNET_2_0_DIR": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.0",
     "LONGCAT_IMAGE_DIR": "meituan-longcat/LongCat-Image",
     "LONGCAT_IMAGE_EDIT_DIR": "meituan-longcat/LongCat-Image-Edit",
 }
@@ -168,8 +168,10 @@ def flux_fill_example(args: argparse.Namespace, **kwargs) -> Example:
         ),
         input_data=ExampleInputData(
             prompt="a white paper cup",
-            image=load_image("./data/cup.png"),
-            mask_image=load_image("./data/cup_mask.png"),
+            image=load_image("https://github.com/vipshop/cache-dit/raw/main/examples/data/cup.png"),
+            mask_image=load_image(
+                "https://github.com/vipshop/cache-dit/raw/main/examples/data/cup_mask.png"
+            ),
             guidance_scale=30,
             height=1024,
             width=1024,
@@ -272,7 +274,7 @@ def flux2_klein_example(args: argparse.Namespace, **kwargs) -> Example:
             },
         ),
         input_data=ExampleInputData(
-            prompt="A cat holding a sign that says hello world",
+            prompt="A cute cat sitting on the beach, watching the sunset.",
             height=1024,
             width=1024,
             num_inference_steps=num_inference_steps,
@@ -450,8 +452,12 @@ def qwen_image_edit_example(args: argparse.Namespace, **kwargs) -> Example:
             true_cfg_scale=true_cfg_scale,  # 1.0 means no separate cfg for lightning models
             # image1, image2
             image=[
-                load_image("./data/edit2509_1.jpg"),
-                load_image("./data/edit2509_2.jpg"),
+                load_image(
+                    "https://github.com/vipshop/cache-dit/raw/main/examples/data/edit2509_1.jpg"
+                ),
+                load_image(
+                    "https://github.com/vipshop/cache-dit/raw/main/examples/data/edit2509_2.jpg"
+                ),
             ],
         ),
     )
@@ -519,7 +525,9 @@ def qwen_image_layered_example(args: argparse.Namespace, **kwargs) -> Example:
             },
         ),
         input_data=ExampleInputData(
-            image=load_image("./data/yarn-art-pikachu.png").convert("RGBA"),
+            image=load_image(
+                "https://github.com/vipshop/cache-dit/raw/main/examples/data/yarn-art-pikachu.png"
+            ).convert("RGBA"),
             prompt="",
             num_inference_steps=50,
             true_cfg_scale=4.0,
@@ -875,8 +883,12 @@ def wan_vace_example(args: argparse.Namespace, **kwargs) -> Example:
         mask = [mask_black, *[mask_white] * (num_frames - 2), mask_black]
         return frames, mask
 
-    first_frame = load_image("./data/flf2v_input_first_frame.png")
-    last_frame = load_image("./data/flf2v_input_last_frame.png")
+    first_frame = load_image(
+        "https://github.com/vipshop/cache-dit/raw/main/examples/data/flf2v_input_first_frame.png"
+    )
+    last_frame = load_image(
+        "https://github.com/vipshop/cache-dit/raw/main/examples/data/flf2v_input_last_frame.png"
+    )
 
     height = 512 if args.height is None else args.height
     width = 512 if args.width is None else args.width
@@ -965,14 +977,14 @@ def _zimage_turbo_steps_mask(
     if not args.cache:
         return None
     return (
-        cache_dit.steps_mask(
+        steps_mask(
             # slow, medium, fast, ultra.
             mask_policy=args.mask_policy,
             total_steps=9 if args.num_inference_steps is None else args.num_inference_steps,
         )
         if args.mask_policy is not None
         else (
-            cache_dit.steps_mask(
+            steps_mask(
                 compute_bins=[5, 1, 1],  # = 7 (compute steps)
                 cache_bins=[1, 1],  # = 2 (dynamic cache steps)
             )
@@ -982,8 +994,9 @@ def _zimage_turbo_steps_mask(
     )
 
 
-@ExampleRegister.register("zimage", default="Tongyi-MAI/Z-Image-Turbo")
-@ExampleRegister.register("zimage_nunchaku", default="nunchaku/nunchaku-z-image-turbo")
+@ExampleRegister.register("zimage", default="Tongyi-MAI/Z-Image")
+@ExampleRegister.register("zimage_turbo", default="Tongyi-MAI/Z-Image-Turbo")
+@ExampleRegister.register("zimage_turbo_nunchaku", default="nunchaku/nunchaku-z-image-turbo")
 def zimage_example(args: argparse.Namespace, **kwargs) -> Example:
     from diffusers import ZImagePipeline
 
@@ -1005,12 +1018,45 @@ def zimage_example(args: argparse.Namespace, **kwargs) -> Example:
     else:
         transformer = None
 
-    steps_computation_mask = _zimage_turbo_steps_mask(args)
+    if "turbo" in args.example.lower():
+        model_name_or_path = _path("Tongyi-MAI/Z-Image-Turbo", args=args)
+        prompt = (
+            "Young Chinese woman in red Hanfu, intricate embroidery. Impeccable makeup, "
+            "red floral forehead pattern. Elaborate high bun, golden phoenix headdress, "
+            "red flowers, beads. Holds round folding fan with lady, trees, bird. Neon "
+            "lightning-bolt lamp (⚡️), bright yellow glow, above extended left palm. "
+            "Soft-lit outdoor night background, silhouetted tiered pagoda (西安大雁塔), "
+            "blurred colorful distant lights."
+        )
+        negative_prompt = None
+        height = 1024
+        width = 1024
+        guidance_scale = 0.0  # Guidance should be 0 for the Turbo models
+        num_inference_steps = 9
+        steps_computation_mask = _zimage_turbo_steps_mask(args)
+    else:
+        model_name_or_path = _path("Tongyi-MAI/Z-Image", args=args)
+        prompt = (
+            "两名年轻亚裔女性紧密站在一起，背景为朴素的灰色纹理墙面，可能是室内地毯地面。"
+            "左侧女性留着长卷发，身穿藏青色毛衣，左袖有奶油色褶皱装饰，内搭白色立领衬衫，"
+            "下身白色裤子；佩戴小巧金色耳钉，双臂交叉于背后。右侧女性留直肩长发，身穿奶油色卫衣，"
+            "胸前印有“Tun the tables”字样，下方为“New ideas”，搭配白色裤子；佩戴银色小环耳环，"
+            "双臂交叉于胸前。两人均面带微笑直视镜头。照片，自然光照明，柔和阴影，以藏青、"
+            "奶油白为主的中性色调，休闲时尚摄影，中等景深，面部和上半身对焦清晰，姿态放松，"
+            "表情友好，室内环境，地毯地面，纯色背景。"
+        )
+        negative_prompt = ""
+        height = 1280
+        width = 720
+        num_inference_steps = 50
+        guidance_scale = 4.0
+        steps_computation_mask = None
+
     return Example(
         args=args,
         init_config=ExampleInitConfig(
             task_type=ExampleType.T2I,  # Text to Image
-            model_name_or_path=_path("Tongyi-MAI/Z-Image-Turbo"),
+            model_name_or_path=model_name_or_path,
             pipeline_class=ZImagePipeline,
             transformer=transformer,  # maybe use Nunchaku zimage transformer
             bnb_4bit_components=["text_encoder"],
@@ -1019,27 +1065,24 @@ def zimage_example(args: argparse.Namespace, **kwargs) -> Example:
             },
         ),
         input_data=ExampleInputData(
-            prompt=(
-                "Young Chinese woman in red Hanfu, intricate embroidery. Impeccable makeup, "
-                "red floral forehead pattern. Elaborate high bun, golden phoenix headdress, "
-                "red flowers, beads. Holds round folding fan with lady, trees, bird. Neon "
-                "lightning-bolt lamp (⚡️), bright yellow glow, above extended left palm. "
-                "Soft-lit outdoor night background, silhouetted tiered pagoda (西安大雁塔), "
-                "blurred colorful distant lights."
-            ),
-            height=1024,
-            width=1024,
-            guidance_scale=0.0,  # Guidance should be 0 for the Turbo models
-            num_inference_steps=9,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            guidance_scale=guidance_scale,  # Guidance should be 0 for the Turbo models
+            num_inference_steps=num_inference_steps,
+            extra_input_kwargs={
+                "cfg_normalization": False,
+            },
         ),
     )
 
 
 @ExampleRegister.register(
-    "zimage_controlnet_2.1", default="alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1"
+    "zimage_turbo_controlnet_2.1", default="alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1"
 )
 @ExampleRegister.register(
-    "zimage_controlnet_2.0", default="alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.0"
+    "zimage_turbo_controlnet_2.0", default="alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.0"
 )
 def zimage_controlnet_example(args: argparse.Namespace, **kwargs) -> Example:
     from diffusers import ZImageControlNetPipeline, ZImageControlNetModel
@@ -1076,7 +1119,9 @@ def zimage_controlnet_example(args: argparse.Namespace, **kwargs) -> Example:
             torch_dtype=torch.bfloat16,
         )
 
-    control_image = load_image("./data/pose.jpg")
+    control_image = load_image(
+        "https://github.com/vipshop/cache-dit/raw/main/examples/data/pose.jpg"
+    )
     steps_computation_mask = _zimage_turbo_steps_mask(args)
 
     return Example(

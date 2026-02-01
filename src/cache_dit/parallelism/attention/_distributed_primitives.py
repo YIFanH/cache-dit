@@ -1,4 +1,3 @@
-import functools
 from typing import Tuple, List, Callable, Optional
 
 import torch
@@ -78,12 +77,24 @@ def _get_rank_world_size(
     return rank, world_size
 
 
-@functools.lru_cache(maxsize=128)
 def _gather_size_by_comm(size: int, group: dist.ProcessGroup) -> List[int]:
     r"""Gather the local size from all ranks.
     size: int, local size
     return: List[int], list of size from all ranks
     """
+    # NOTE(Serving/CP Safety):
+    # Do NOT cache this collective result.
+    #
+    # In "Ulysses Anything" mode, `size` (e.g. per-rank local seq_len / S_LOCAL)
+    # may legitimately differ across ranks. If we cache based on the *local* `size`,
+    # different ranks can have different cache hit/miss patterns across time.
+    #
+    # That can lead to a catastrophic distributed hang:
+    # - some ranks hit cache and *skip* dist.all_gather()
+    # - other ranks miss cache and *enter* dist.all_gather()
+    # This mismatched collective participation will stall the process group and
+    # eventually trigger NCCL watchdog timeouts (often surfacing later as ALLTOALL
+    # timeouts in Ulysses attention).
     world_size = dist.get_world_size(group=group)
     # HACK: Use Gloo backend for all_gather to avoid H2D and D2H overhead
     comm_backends = str(dist.get_backend(group=group))
@@ -217,9 +228,13 @@ def _prepare_ulysses_comm_metadata(
     query: torch.Tensor,
     **kwargs,
 ) -> dict:
-    num_qo_head = query.shape[2]  # (B, S_LOCAL, H_GLOBAL, D)
+    # query: (B, S_LOCAL, H_GLOBAL, D)
+    assert (
+        len(query.shape) == 4
+    ), "Query tensor must be 4-dimensional of shape (B, S_LOCAL, H_GLOBAL, D)"
     extra_kwargs = {}
-    extra_kwargs["num_qo_head"] = num_qo_head
+    extra_kwargs["NUM_QO_HEAD"] = query.shape[2]
+    extra_kwargs["Q_S_LOCAL"] = query.shape[1]
     # Add other kwargs if needed in future
     return extra_kwargs
 
@@ -267,7 +282,7 @@ def _all_to_all_single_o_async(
     """
     # Assume H is provided in kwargs, since we can't infer H from x's shape.
     # The padding logic needs H to determine if padding is necessary.
-    H = kwargs.get("num_qo_head", None)
+    H = kwargs.get("NUM_QO_HEAD", None)
     _, world_size = _get_rank_world_size(group)
     x, H_PAD = _maybe_pad_o_head(x, H, group)
     B, S_GLOBAL, H_LOCAL, D = x.shape
@@ -340,7 +355,7 @@ def _all_to_all_single_o_uneven_heads_async(
     """
     # Assume H is provided in kwargs, since we can't infer H from x's shape.
     # The padding logic needs H to determine if padding is necessary.
-    H = kwargs.get("num_qo_head", None)
+    H = kwargs.get("NUM_QO_HEAD", None)
     B, S_GLOBAL, H_LOCAL, D = x.shape
     rank, world_size = _get_rank_world_size(group)
     # e.g, H = 30, world_size = 4, output_split_sizes = [8, 8, 8, 6]
@@ -411,7 +426,7 @@ def _all_to_all_single_o_fp8_async(
     """
     # Assume H is provided in kwargs, since we can't infer H from x's shape.
     # The padding logic needs H to determine if padding is necessary.
-    H = kwargs.get("num_qo_head", None)
+    H = kwargs.get("NUM_QO_HEAD", None)
     _, world_size = _get_rank_world_size(group)
     x, H_PAD = _maybe_pad_o_head(x, H, group)
     B, S_GLOBAL, H_LOCAL, D = x.shape
@@ -492,19 +507,25 @@ def _all_to_all_single_any_o_async(
     """
     # Assume H is provided in kwargs, since we can't infer H from x's shape.
     # The padding logic needs H to determine if padding is necessary.
-    H = kwargs.get("num_qo_head", None)
+    H = kwargs.get("NUM_QO_HEAD", None)
     rank, world_size = _get_rank_world_size(group)
     x, H_PAD = _maybe_pad_o_head(x, H, group)
     shape = x.shape  # (B, S_GLOBAL, H_LOCAL, D)
     (B, S_GLOBAL, H_LOCAL, D) = shape
-    # NOTE: May use tensor_split here to ensure the same split policy
-    # that we have used in the EquipartitionSharder sharding strategy. Please
-    # note that the 'tensor_split' Splits a tensor into multiple sub-tensors,
-    # all of which are views of input, thus may not introduce extra IO access.
-    input_split_sizes = [o.size(1) for o in torch.tensor_split(x, world_size, dim=1)]
     # input_split: e.g, S_GLOBAL=9 input splits across ranks [[5,4], [5,4],..]
     # output_split: e.g, S_GLOBAL=9 output splits across ranks [[5,5], [4,4],..]
-    S_LOCAL = input_split_sizes[rank]
+
+    # WARN: In some cases, e.g, joint attn in Qwen-Image, the S_LOCAL can not infer
+    # from tensor split due to: if c = torch.cat((a, b)), world_size=4, then,
+    # c.tensor_split(4)[0].shape[1] may != to (a.tensor_split(4)[0].shape[1] +
+    # b.tensor_split(4)[0].shape[1])
+
+    # input_split_sizes = [o.size(1) for o in torch.tensor_split(x, world_size, dim=1)]
+    # S_LOCAL = input_split_sizes[rank]
+
+    S_LOCAL = kwargs.get("Q_S_LOCAL")
+    input_split_sizes = _gather_size_by_comm(S_LOCAL, group)
+
     x = x.permute(1, 0, 2, 3).contiguous()  # (S_GLOBAL, B, H_LOCAL, D)
     output_split_sizes = [S_LOCAL] * world_size
     x = fc.all_to_all_single(x, output_split_sizes, input_split_sizes, group)
@@ -572,20 +593,26 @@ def _all_to_all_single_any_o_fp8_async(
     """
     # Assume H is provided in kwargs, since we can't infer H from x's shape.
     # The padding logic needs H to determine if padding is necessary.
-    H = kwargs.get("num_qo_head", None)
+    H = kwargs.get("NUM_QO_HEAD", None)
     rank, world_size = _get_rank_world_size(group)
     x, H_PAD = _maybe_pad_o_head(x, H, group)
     shape = x.shape  # (B, S_GLOBAL, H_LOCAL, D)
     x = per_token_quant_fp8(x)
     (B, S_GLOBAL, H_LOCAL, D) = shape
-    # NOTE: May use tensor_split here to ensure the same split policy
-    # that we have used in the EquipartitionSharder sharding strategy. Please
-    # note that the 'tensor_split' Splits a tensor into multiple sub-tensors,
-    # all of which are views of input, thus may not introduce extra IO access.
-    input_split_sizes = [o.size(1) for o in torch.tensor_split(x, world_size, dim=1)]
     # input_split: e.g, S_GLOBAL=9 input splits across ranks [[5,4], [5,4],..]
     # output_split: e.g, S_GLOBAL=9 output splits across ranks [[5,5], [4,4],..]
-    S_LOCAL = input_split_sizes[rank]
+
+    # WARN: In some cases, e.g, joint attn in Qwen-Image, the S_LOCAL can not infer
+    # from tensor split due to: if c = torch.cat((a, b)), world_size=4, then,
+    # c.tensor_split(4)[0].shape[1] may != to (a.tensor_split(4)[0].shape[1] +
+    # b.tensor_split(4)[0].shape[1])
+
+    # input_split_sizes = [o.size(1) for o in torch.tensor_split(x, world_size, dim=1)]
+    # S_LOCAL = input_split_sizes[rank]
+
+    S_LOCAL = kwargs.get("Q_S_LOCAL")
+    input_split_sizes = _gather_size_by_comm(S_LOCAL, group)
+
     x = x.permute(1, 0, 2, 3).contiguous()  # (S_GLOBAL, B, H_LOCAL, D)
     output_split_sizes = [S_LOCAL] * world_size
     x = fc.all_to_all_single(x, output_split_sizes, input_split_sizes, group)

@@ -18,22 +18,23 @@
 
 </div>
 
-**🤗Why Cache-DiT❓❓**Cache-DiT is built on top of the Diffusers library and now supports nearly **[🔥ALL](https://cache-dit.readthedocs.io/en/latest/)** DiTs from Diffusers, including over **[🤗70+](https://github.com/vipshop/cache-dit)** DiTs. Please refer to our online documentation at [readthedocs.io](https://cache-dit.readthedocs.io/en/latest/) for more details. The optimizations made by Cache-DiT include: (**UAA**: [Ulysses Anything Attention](https://cache-dit.readthedocs.io/en/latest/user_guide/CONTEXT_PARALLEL/#uaa-ulysses-anything-attention))   
+**🤗Why Cache-DiT❓❓**Cache-DiT is built on top of the Diffusers library and now supports nearly **[🔥ALL](https://cache-dit.readthedocs.io/en/latest/)** DiTs from Diffusers, including over **[🤗70+](https://github.com/vipshop/cache-dit)** DiTs. Please refer to our online documentation at [readthedocs.io](https://cache-dit.readthedocs.io/en/latest/) for more details. The optimizations made by Cache-DiT include:  
 
 - 🎉**Hybrid Cache Acceleration** ([**DBCache**](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/#dbcache-dual-block-cache), DBPrune, [**TaylorSeer**](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/#hybrid-taylorseer-calibrator), [**SCM**](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/#scm-steps-computation-masking) and more)
-- 🎉**Context Parallelism** (w/ Extended Diffusers' CP APIs, [**UAA**](https://cache-dit.readthedocs.io/en/latest/user_guide/CONTEXT_PARALLEL/#uaa-ulysses-anything-attention), Async Ulysses, FP8 comm)
+- 🎉**Context Parallelism** (w/ Ulysses, Ring, **[USP](https://arxiv.org/pdf/2405.07719)**, [**Ulysses Anything**](https://cache-dit.readthedocs.io/en/latest/user_guide/CONTEXT_PARALLEL/#uaa-ulysses-anything-attention), FP8 Comm)
 - 🎉**Tensor Parallelism** (w/ PyTorch native DTensor and Tensor Parallelism APIs)
-- 🎉**Text Encoder Parallelism** (w/ PyTorch native DTensor and Tensor Parallelism APIs)
-- 🎉**Auto Encoder (VAE) Parallelism** (w/ Data or Tile Parallelism, avoid OOM)
-- 🎉**ControlNet Parallelism** (w/ Context Parallelism for ControlNet module)
+- 🎉**Hybrid [2D](https://cache-dit.readthedocs.io/en/latest/user_guide/HYBRID_PARALLEL/) and [3D](https://cache-dit.readthedocs.io/en/latest/user_guide/HYBRID_PARALLEL/) Parallelism** (Scale up the performance of [**💥Large DiTs**](https://cache-dit.readthedocs.io/en/latest/user_guide/HYBRID_PARALLEL/))
+- 🎉**Text Encoder Parallelism** ([**TE-P**](https://cache-dit.readthedocs.io/en/latest/user_guide/EXTRA_PARALLEL) w/ PyTorch native Tensor Parallelism APIs)
+- 🎉**Auto Encoder Parallelism** ([**VAE-P**](https://cache-dit.readthedocs.io/en/latest/user_guide/EXTRA_PARALLEL) w/ Tile Parallelism, faster, avoid OOM)
+- 🎉**ControlNet Parallelism** ([**CN-P**](https://cache-dit.readthedocs.io/en/latest/user_guide/EXTRA_PARALLEL) w/ Context Parallelism for ControlNet)
 - 🎉Built-in **HTTP serving** deployment support with simple REST APIs
 - 🎉**Natively** compatible with **Compile**, **Offloading**, **Quantization**, ...
 - 🎉Integration into **vLLM-Omni**, **SGLang Diffusion**, SD.Next, ...
 - 🎉**Natively** supports **NVIDIA GPUs**, [**Ascend NPUs**](https://cache-dit.readthedocs.io/en/latest/user_guide/ASCEND_NPU/) (>= 1.2.0), ...  
-
+   
 ## 🔥Latest News 
 
-- [2026/01] **[🎉v1.2.0 Major Release](https://github.com/vipshop/cache-dit)** is ready: New Models Support(Z-Image, FLUX.2, LTX-2, etc), Request level Cache Context, HTTP Serving, [Ulysses Anything Attention](https://cache-dit.readthedocs.io/en/latest/user_guide/CONTEXT_PARALLEL/#uaa-ulysses-anything-attention), TE-P, VAE-P, CN-P and [Ascend NPUs](https://cache-dit.readthedocs.io/en/latest/user_guide/ASCEND_NPU/) Support.
+- [2026/01] **[🎉v1.2.0 Major Release](https://github.com/vipshop/cache-dit)** is ready: New Models Support(Z-Image, FLUX.2, LTX-2, etc), Request level Cache Context, HTTP Serving, [Ulysses Anything](https://cache-dit.readthedocs.io/en/latest/user_guide/CONTEXT_PARALLEL/#uaa-ulysses-anything-attention), TE-P, VAE-P, CN-P and [Ascend NPUs](https://cache-dit.readthedocs.io/en/latest/user_guide/ASCEND_NPU/) Support.
 
 ## 🚀Quick Start 
 
@@ -41,7 +42,7 @@ You can install the cache-dit from PyPI or from source:
 ```bash
 pip3 install -U cache-dit # or, pip3 install git+https://github.com/vipshop/cache-dit.git
 ```
-Then try ♥️ Cache Acceleration with just **one line** of code ~ ♥️
+Then accelerate your DiTs with just **♥️one line♥️** of code ~  
 ```python
 >>> import cache_dit
 >>> from diffusers import DiffusionPipeline
@@ -49,15 +50,24 @@ Then try ♥️ Cache Acceleration with just **one line** of code ~ ♥️
 >>> pipe = DiffusionPipeline.from_pretrained("Qwen/Qwen-Image")
 >>> # Cache Acceleration with One-line code.
 >>> cache_dit.enable_cache(pipe)
->>> # Or, Hybrid Cache Acceleration + Parallelism.
+>>> # Or, Hybrid Cache Acceleration + 1D Parallelism.
 >>> from cache_dit import DBCacheConfig, ParallelismConfig
 >>> cache_dit.enable_cache(
-...   pipe, cache_config=DBCacheConfig(), 
-...   parallelism_config=ParallelismConfig(ulysses_size=2)
-... )
+...   pipe, cache_config=DBCacheConfig(), # w/ default
+...   parallelism_config=ParallelismConfig(ulysses_size=2))
+>>> # Or, Hybrid Cache Acceleration + 2D Parallelism.
+>>> cache_dit.enable_cache(
+...   pipe, cache_config=DBCacheConfig(), # w/ default
+...   parallelism_config=ParallelismConfig(ulysses_size=2, tp_size=2))
+>>> # Or, Use Distributed Inference without Cache Acceleration.
+>>> cache_dit.enable_cache(
+...   pipe, cache_config=None, # Set cache_config as None.
+...   parallelism_config=ParallelismConfig(ulysses_size=2))
 >>> from cache_dit import load_configs
 >>> # Or, Load Acceleration config from a custom yaml file.
 >>> cache_dit.enable_cache(pipe, **load_configs("config.yaml"))
+>>> # Optional, set attention backend for better performance.
+>>> cache_dit.set_attn_backend(pipe, attention_backend=...)
 >>> output = pipe(...) # Just call the pipe as normal.
 ```
 Please refer to our online documentation at [readthedocs.io](https://cache-dit.readthedocs.io/en/latest/) for more details.
@@ -71,9 +81,10 @@ Please refer to our online documentation at [readthedocs.io](https://cache-dit.r
 
 ## 🌐Community Integration
 
+- 🎉[ComfyUI x Cache-DiT](https://github.com/Jasonzzt/ComfyUI-CacheDiT)
 - 🔥[Ascend NPU x Cache-DiT](https://cache-dit.readthedocs.io/en/latest/user_guide/ASCEND_NPU/)
 - 🎉[Diffusers x Cache-DiT](https://huggingface.co/docs/diffusers/main/en/optimization/cache_dit)
-- 🎉[SGLang Diffusion x Cache-DiT](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/cache_dit.md)
+- 🎉[SGLang Diffusion x Cache-DiT](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/cache/cache_dit.md)
 - 🎉[vLLM-Omni x Cache-DiT](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_dit_acceleration/)
 - 🎉[Nunchaku x Cache-DiT](https://nunchaku.tech/docs/nunchaku/usage/cache.html#cache-dit)
 - 🎉[SD.Next x Cache-DiT](https://github.com/vladmandic/sdnext/blob/master/modules/cachedit.py)

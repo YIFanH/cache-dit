@@ -14,10 +14,11 @@ from diffusers import DiffusionPipeline, ModelMixin
 from transformers import GenerationMixin
 from diffusers.loaders.lora_base import LoraBaseMixin
 from diffusers.quantizers import PipelineQuantizationConfig
-from cache_dit.logger import init_logger
-import cache_dit
 
-from utils import (
+from ..summary import summary
+from ..logger import init_logger
+
+from .utils import (
     strify,
     maybe_destroy_distributed,
     maybe_init_distributed,
@@ -350,6 +351,11 @@ class ExampleInitConfig:
     def __post_init__(self):
         if not self.bnb_4bit_components:
             self.bnb_4bit_components = ["text_encoder"]
+        if self.extra_optimize_kwargs:
+            # remove None values
+            self.extra_optimize_kwargs = {
+                k: v for k, v in self.extra_optimize_kwargs.items() if v is not None
+            }
 
     def get_pipe(self, args: argparse.Namespace, **kwargs) -> DiffusionPipeline:
         if self.pipeline_class is None:
@@ -594,7 +600,7 @@ class Example:
 
         if self.args.cache_summary:
             if self.rank == 0:
-                cache_dit.summary(pipe)
+                summary(pipe)
 
         if memory_tracker:
             memory_tracker.__exit__(None, None, None)
