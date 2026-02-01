@@ -31,19 +31,21 @@ import requests
 from PIL import Image
 
 
-def call_api(prompt, image_paths, name="qwen_image_edit_lora", **kwargs):
+def call_api(prompt,negative_prompt,image_paths, name="qwen_image_edit_lora", **kwargs):
     host = os.environ.get("CACHE_DIT_HOST", "localhost")
     port = int(os.environ.get("CACHE_DIT_PORT", 8000))
     url = f"http://{host}:{port}/generate"
 
     payload = {
         "prompt": prompt,
+        "negative_prompt": negative_prompt,
         "width": kwargs["width"],
         "height": kwargs["height"],
         "num_inference_steps": kwargs.get("num_inference_steps", 30),
         "guidance_scale": kwargs.get("guidance_scale", 4.0),
         "seed": kwargs.get("seed", 1),
         "num_images": kwargs.get("num_images", 1),
+        "image_auto_resize": kwargs.get("image_auto_resize", True),
         "image_urls": image_paths,
     }
 
@@ -89,9 +91,10 @@ def test_qwen_image_edit_lora():
         "Using the provided image, first erase all texts (no language restrictions, titles, slogan, date, number, "
         "logo text) from the image, erase all texts from the image, and finally, keep everything else unchanged."
     )
-
+    negative_prompt = ''
     filename = call_api(
         prompt=prompt,
+        negative_prompt=negative_prompt,
         image_paths=[image_path_0, image_path_1],
         name="qwen_image_edit_lora",
         seed=1,
@@ -99,6 +102,7 @@ def test_qwen_image_edit_lora():
         guidance_scale=4.0,
         width=width,
         height=height,
+        image_auto_resize=False,
     )
 
     out_img = Image.open(filename)

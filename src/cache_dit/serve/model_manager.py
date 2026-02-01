@@ -94,6 +94,7 @@ class GenerateRequest:
     include_stats: bool = False
     output_format: str = "base64"
     output_dir: Optional[str] = None
+    image_auto_resize: bool = True
 
     def __repr__(self):
         image_urls_repr = None
@@ -106,7 +107,8 @@ class GenerateRequest:
             f"width={self.width}, height={self.height}, "
             f"num_inference_steps={self.num_inference_steps}, "
             f"guidance_scale={self.guidance_scale}, seed={self.seed}, "
-            f"num_images={self.num_images}, image_urls={image_urls_repr})"
+            f"num_images={self.num_images}, image_urls={image_urls_repr}),"
+            f"negative_prompt={self.negative_prompt}, image_auto_resize={self.image_auto_resize})"
         )
 
 
@@ -326,13 +328,23 @@ class ModelManager:
             logger.info("Enabling DBCache acceleration")
             from cache_dit import DBCacheConfig
 
-            cache_config_obj = DBCacheConfig(
-                residual_diff_threshold=0.24,
-            )
+            if self.lora_path is not None and "qwen-image-edit" in self.model_path.lower():
+                cache_config_obj = DBCacheConfig(
+                    residual_diff_threshold=0.12,
+                    enable_separate_cfg=True,
+                    cfg_diff_compute_separate=True,
+                )
+            else:
+                cache_config_obj = DBCacheConfig(
+                    residual_diff_threshold=0.24,
+                )
+
             if self.cache_config:
                 for key, value in self.cache_config.items():
+                    if key in ['residual_diff_threshold','enable_separate_cfg','cfg_diff_compute_separate']:
+                       continue
                     setattr(cache_config_obj, key, value)
-
+        print('cache_config_obj is ', cache_config_obj)
         params_modifiers = None
         if self.enable_cache and cache_config_obj is not None:
             params_modifiers = get_default_params_modifiers(
@@ -687,6 +699,10 @@ class ModelManager:
             else:
                 pipe_kwargs["image"] = input_images
 
+            if self.lora_path is not None and "qwen-image-edit" in self.model_path.lower():
+                pipe_kwargs['negative_prompt'] = request.negative_prompt
+                pipe_kwargs['image_auto_resize'] = request.image_auto_resize
+
         # Some pipelines (like Flux2Pipeline) don't support negative_prompt
         if request.negative_prompt:
             try:
@@ -697,6 +713,7 @@ class ModelManager:
                 # If we can't inspect, try to add it anyway
                 pipe_kwargs["negative_prompt"] = request.negative_prompt
 
+        print('pipe_kwargs is ', pipe_kwargs)
         output = pipe_to_use(**pipe_kwargs)
 
         if self.parallel_type in ["tp", "ulysses", "ring"]:

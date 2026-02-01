@@ -42,6 +42,7 @@ class GenerateRequestAPI(BaseModel):
         None, description="Number of frames for video generation", ge=1, le=200
     )
     fps: Optional[int] = Field(16, description="Frames per second for video output", ge=1, le=60)
+    image_auto_resize: bool = Field(True, description="Whether to automatically resize input images")
     include_stats: bool = Field(False, description="Include stats field in response")
     output_format: Literal["base64", "path"] = Field(
         "base64",
@@ -122,6 +123,7 @@ def create_app(model_manager: ModelManager) -> FastAPI:
                     include_stats=request.include_stats,
                     output_format=request.output_format,
                     output_dir=request.output_dir,
+                    image_auto_resize=request.image_auto_resize,
                 )
 
                 loop = asyncio.get_event_loop()
